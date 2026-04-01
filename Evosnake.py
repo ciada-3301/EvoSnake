@@ -1,111 +1,150 @@
 """
-EvoSnake — Neuroevolution Artificial Life Simulation
-=====================================================
-Requirements:  pip install pygame numpy
+EvoSnake — Neuroevolution with PyTorch Policy Networks
+=======================================================
+Requirements:
+    pip install pygame numpy torch
+
+Architecture:
+    Each agent carries a PyTorch nn.Module (SnakeNet).
+    Evolution is done via weight cloning + Gaussian mutation
+    (no gradient-based training — pure genetic algorithm).
 
 Controls:
-  SPACE      Pause / Resume
-  R          Reset simulation
-  N          Force next generation
-  UP / DOWN  Change simulation speed
-  M          Toggle mutation rate (low / med / high)
-  D          Toggle debug overlay
-  ESC / Q    Quit
+    SPACE      Pause / Resume
+    R          Reset simulation
+    N          Force next generation
+    UP / DOWN  Speed up / slow down
+    M          Cycle mutation rate
+    A          Toggle architecture info overlay
+    D          Toggle debug (fitness labels)
+    ESC / Q    Quit
 """
 
-import sys
-import math
-import random
+import sys, math, random
 import numpy as np
 import pygame
+import torch
+import torch.nn as nn
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-W, H          = 900, 620      # window size
-SIM_W, SIM_H  = 620, 620      # simulation canvas (left panel)
-PANEL_W       = W - SIM_W     # right info panel
+# ──────────────────────────────────────────────────────────
+# HYPERPARAMETERS
+# ──────────────────────────────────────────────────────────
+W, H           = 960, 640
+SIM_W, SIM_H   = 640, 640
+PANEL_W        = W - SIM_W
 
-POP_SIZE      = 20
-FOOD_COUNT    = 20
-STEPS_PER_GEN = 1000
-AGENT_SPEED   = 2.8
-ENERGY_DRAIN  = 0.001
-ENERGY_FOOD   = 0.40
-EAT_RADIUS    = 10
-ELITE_FRAC    = 0.10
-MUTATION_RATE = 0.08
-TRAIL_LEN     = 24
-FPS_CAP       = 120
+POP_SIZE       = 32
+FOOD_COUNT     = 22
+STEPS_PER_GEN  = 650
+AGENT_SPEED    = 2.8
+ENERGY_DRAIN   = 0.00065
+ENERGY_FOOD    = 0.42
+EAT_RADIUS     = 11
+ELITE_FRAC     = 0.20
+TRAIL_LEN      = 28
+FPS_CAP        = 120
 
-# Neural net shape: 7 inputs → 12 hidden → 2 outputs
-NN_SHAPE = (11,256, 256,256,256, 2)
+INPUT_DIM   = 8
+HIDDEN_DIM  = 16
+OUTPUT_DIM  = 2
 
-# Colour palette
-BG          = (10,  14,  22)
-GRID_COL    = (255, 255, 255,  8)
-FOOD_OUTER  = (245, 158,  11)
-FOOD_INNER  = (252, 211,  77)
+MUT_RATES  = [0.02, 0.07, 0.18]
+MUT_LABELS = ["Low  0.02", "Med  0.07", "High 0.18"]
+
+DEVICE = torch.device("cpu")   # CPU is plenty fast for small nets
+
+# ──────────────────────────────────────────────────────────
+# COLOURS
+# ──────────────────────────────────────────────────────────
+BG          = ( 10,  14,  22)
+FOOD_OUT    = (245, 158,  11)
+FOOD_IN     = (252, 211,  77)
 ELITE_COL   = ( 74, 222, 128)
 NORMAL_COL  = ( 96, 165, 250)
-DEAD_COL    = ( 60,  60,  80)
+DEAD_COL    = ( 55,  55,  75)
 VEC_COL     = (239,  68,  68)
-PANEL_BG    = ( 18,  22,  32)
-PANEL_LINE  = ( 40,  50,  70)
+PANEL_BG    = ( 16,  20,  32)
+PANEL_LINE  = ( 38,  48,  70)
 TEXT_HI     = (220, 220, 235)
-TEXT_LO     = (120, 130, 155)
-GREEN_CHART = ( 74, 222, 128)
-BLUE_CHART  = ( 96, 165, 250)
-
-MUT_PRESETS = [0.03, 0.08, 0.20]
-MUT_LABELS  = ["Low (0.03)", "Med (0.08)", "High (0.20)"]
+TEXT_LO     = (115, 125, 152)
+COL_GREEN   = ( 74, 222, 128)
+COL_BLUE    = ( 96, 165, 250)
+COL_AMBER   = (245, 158,  11)
 
 
-# ─────────────────────────────────────────────
-# NEURAL NETWORK  (pure numpy, no torch needed)
-# ─────────────────────────────────────────────
-def nn_weights_size(shape):
-    n = 0
-    for i in range(len(shape) - 1):
-        n += shape[i] * shape[i+1] + shape[i+1]
-    return n
+# ──────────────────────────────────────────────────────────
+# PYTORCH POLICY NETWORK
+# ──────────────────────────────────────────────────────────
+class SnakeNet(nn.Module):
+    """
+    Lightweight MLP policy:
+      Input  (8):  food_dx, food_dy, food_dist, vx, vy,
+                   energy, wall_dx, wall_dy
+      Hidden (16): tanh
+      Output (2):  steering (dx, dy) via tanh  ∈ [-1, 1]
+    """
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(INPUT_DIM, HIDDEN_DIM),
+            nn.Tanh(),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
+            nn.Tanh(),
+            nn.Linear(HIDDEN_DIM, OUTPUT_DIM),
+            nn.Tanh(),
+        )
+        # Xavier init for cleaner early behaviour
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
-def random_weights(shape):
-    return np.random.randn(nn_weights_size(shape)).astype(np.float32) * 0.8
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
-def mutate_weights(w, rate):
-    noise = np.random.randn(*w.shape).astype(np.float32)
-    mask  = np.random.random(w.shape) < 0.35
-    return w + noise * rate * mask
+    # ── Genetic operators ──────────────────────────────
+    def get_flat_params(self) -> torch.Tensor:
+        return torch.cat([p.data.view(-1) for p in self.parameters()])
 
-def nn_forward(flat_w, inp, shape):
-    x = np.array(inp, dtype=np.float32)
-    idx = 0
-    for i in range(len(shape) - 1):
-        r, c = shape[i+1], shape[i]
-        W_ = flat_w[idx : idx + r*c].reshape(r, c); idx += r*c
-        b_ = flat_w[idx : idx + r];                  idx += r
-        x  = np.tanh(W_ @ x + b_)
-    return x
+    def set_flat_params(self, flat: torch.Tensor):
+        idx = 0
+        for p in self.parameters():
+            n = p.numel()
+            p.data.copy_(flat[idx: idx + n].view_as(p))
+            idx += n
+
+    def clone(self) -> "SnakeNet":
+        child = SnakeNet().to(DEVICE)
+        child.set_flat_params(self.get_flat_params().clone())
+        return child
+
+    def mutate(self, rate: float) -> "SnakeNet":
+        child = self.clone()
+        flat  = child.get_flat_params()
+        # Sparse perturbation: only ~30 % of weights mutated
+        mask  = torch.rand_like(flat) < 0.30
+        noise = torch.randn_like(flat) * rate
+        child.set_flat_params(flat + noise * mask)
+        return child
+
+    @staticmethod
+    def crossover(a: "SnakeNet", b: "SnakeNet") -> "SnakeNet":
+        """Uniform crossover — randomly pick each weight from either parent."""
+        fa, fb = a.get_flat_params(), b.get_flat_params()
+        mask   = torch.rand_like(fa) > 0.5
+        child  = SnakeNet().to(DEVICE)
+        child.set_flat_params(torch.where(mask, fa, fb))
+        return child
+
+    def param_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
 
 
-# ─────────────────────────────────────────────
-# FOOD
-# ─────────────────────────────────────────────
-def spawn_food(count):
-    margin = 15
-    return [
-        [random.uniform(margin, SIM_W - margin),
-         random.uniform(margin, SIM_H - margin)]
-        for _ in range(count)
-    ]
-
-
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 # AGENT
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 class Agent:
-    def __init__(self, weights=None):
+    def __init__(self, net: SnakeNet = None):
         self.x  = random.uniform(30, SIM_W - 30)
         self.y  = random.uniform(30, SIM_H - 30)
         ang     = random.uniform(0, 2 * math.pi)
@@ -114,58 +153,53 @@ class Agent:
         self.energy  = 1.0
         self.fitness = 0
         self.alive   = True
-        self.trail   = []
-        self.weights = weights if weights is not None else random_weights(NN_SHAPE)
+        self.trail: list = []
+        self.net    = net if net is not None else SnakeNet().to(DEVICE)
 
-    def nearest_food(self, foods):
-        best_d, best_f = math.inf, None
+    # ── Sensing ───────────────────────────────────────
+    def _nearest_food(self, foods):
+        bx, by, bd = 0.0, 0.0, float("inf")
         for f in foods:
             d = math.hypot(f[0] - self.x, f[1] - self.y)
-            if d < best_d:
-                best_d, best_f = d, f
-        return best_f, best_d
+            if d < bd:
+                bd, bx, by = d, f[0], f[1]
+        return bx, by, bd
 
-    def step(self, foods):
+    # ── One simulation tick ───────────────────────────
+    def step(self, foods) -> list | None:
         if not self.alive:
             return None
 
-        food, dist = self.nearest_food(foods)
-        if food is None:
-            return None
+        fx, fy, dist = self._nearest_food(foods)
 
-        fx, fy  = food
+        # Wall repulsion signal (normalised distance to nearest wall)
+        wx = min(self.x, SIM_W - self.x) / (SIM_W / 2)
+        wy = min(self.y, SIM_H - self.y) / (SIM_H / 2)
+
         inv_d   = 1.0 / max(dist, 1.0)
         dx_norm = (fx - self.x) * inv_d
         dy_norm = (fy - self.y) * inv_d
-        spd_inv = 1.0 / AGENT_SPEED
-        dist_left   = self.x / SIM_W
-        dist_right  = (SIM_W - self.x) / SIM_W
-        dist_top    = self.y / SIM_H
-        dist_bottom = (SIM_H - self.y) / SIM_H
 
-        inp = [
+        inp = torch.tensor([
             dx_norm,
             dy_norm,
-            min(dist / 400.0, 1.0),
-            self.vx * spd_inv,
-            self.vy * spd_inv,
+            min(dist / 450.0, 1.0),
+            self.vx / AGENT_SPEED,
+            self.vy / AGENT_SPEED,
             self.energy,
-            dist_left,
-            dist_right,
-            dist_top,
-            dist_bottom,
-            1.0 if dist < 60 else 0.0,  # "food close" signal
-        ]
+            wx,
+            wy,
+        ], dtype=torch.float32, device=DEVICE)
 
-        out = nn_forward(self.weights, inp, NN_SHAPE)
-        # Blend neural steering with a soft food-seeking bias
-        #blend = 0.55
-        #tx = out[0] * (1 - blend) + dx_norm * blend
-        #ty = out[1] * (1 - blend) + dy_norm * blend
-        tx, ty = out[0], out[1]
-        # Smooth velocity update
-        self.vx = self.vx * 0.6 + tx * AGENT_SPEED * 0.4
-        self.vy = self.vy * 0.6 + ty * AGENT_SPEED * 0.4
+        with torch.no_grad():
+            out = self.net(inp).cpu().numpy()  # shape (2,)
+
+        # Blend: neural steering + soft food-seeking bias
+        blend   = 0.50
+        tx      = out[0] * (1 - blend) + dx_norm * blend
+        ty      = out[1] * (1 - blend) + dy_norm * blend
+        self.vx = self.vx * 0.55 + tx * AGENT_SPEED * 0.45
+        self.vy = self.vy * 0.55 + ty * AGENT_SPEED * 0.45
         spd = math.hypot(self.vx, self.vy) or 1.0
         self.vx = (self.vx / spd) * AGENT_SPEED
         self.vy = (self.vy / spd) * AGENT_SPEED
@@ -185,84 +219,97 @@ class Agent:
         if dist < EAT_RADIUS:
             self.fitness += 1
             self.energy   = min(1.0, self.energy + ENERGY_FOOD)
-            return food
+            return foods[foods.index([fx, fy])]   # return the eaten food object
 
         return None
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 # EVOLUTION ENGINE
-# ─────────────────────────────────────────────
-def evolve(agents, mut_rate, pop_size):
+# ──────────────────────────────────────────────────────────
+def evolve(agents: list[Agent], mut_rate: float, pop_size: int) -> list[Agent]:
     ranked  = sorted(agents, key=lambda a: a.fitness, reverse=True)
     n_elite = max(2, int(len(ranked) * ELITE_FRAC))
     elite   = ranked[:n_elite]
 
-    new_agents = []
-    # Keep top 2 unchanged
+    new_agents: list[Agent] = []
+
+    # 1) Preserve top 2 unchanged
     for e in elite[:2]:
-        new_agents.append(Agent(weights=e.weights.copy()))
-    # Fill rest with mutated elite offspring
+        new_agents.append(Agent(net=e.net.clone()))
+
+    # 2) Crossover offspring (~25 % of remaining slots)
+    n_cross = max(0, (pop_size - 2) // 4)
+    for _ in range(n_cross):
+        p1, p2 = random.sample(elite, 2)
+        child_net = SnakeNet.crossover(p1.net, p2.net)
+        new_agents.append(Agent(net=child_net))
+
+    # 3) Mutated offspring fill the rest
     while len(new_agents) < pop_size:
-        parent = random.choice(elite)
-        child_w = mutate_weights(parent.weights, mut_rate)
-        new_agents.append(Agent(weights=child_w))
+        parent    = random.choice(elite)
+        child_net = parent.net.mutate(mut_rate)
+        new_agents.append(Agent(net=child_net))
 
     return new_agents
 
 
-# ─────────────────────────────────────────────
-# RENDERING HELPERS
-# ─────────────────────────────────────────────
+def spawn_food(count: int) -> list:
+    m = 15
+    return [[random.uniform(m, SIM_W - m), random.uniform(m, SIM_H - m)]
+            for _ in range(count)]
+
+
+# ──────────────────────────────────────────────────────────
+# RENDERING
+# ──────────────────────────────────────────────────────────
 def draw_grid(surf):
-    grid_surf = pygame.Surface((SIM_W, SIM_H), pygame.SRCALPHA)
+    s = pygame.Surface((SIM_W, SIM_H), pygame.SRCALPHA)
     for x in range(0, SIM_W, 30):
-        pygame.draw.line(grid_surf, (255, 255, 255, 8), (x, 0), (x, SIM_H))
+        pygame.draw.line(s, (255, 255, 255, 7), (x, 0), (x, SIM_H))
     for y in range(0, SIM_H, 30):
-        pygame.draw.line(grid_surf, (255, 255, 255, 8), (0, y), (SIM_W, y))
-    surf.blit(grid_surf, (0, 0))
+        pygame.draw.line(s, (255, 255, 255, 7), (0, y), (SIM_W, y))
+    surf.blit(s, (0, 0))
 
 
 def draw_food(surf, foods):
     for f in foods:
         x, y = int(f[0]), int(f[1])
-        pygame.draw.circle(surf, FOOD_OUTER, (x, y), 6)
-        pygame.draw.circle(surf, FOOD_INNER, (x, y), 3)
+        pygame.draw.circle(surf, FOOD_OUT, (x, y), 6)
+        pygame.draw.circle(surf, FOOD_IN,  (x, y), 3)
 
 
-def draw_agent(surf, agent, is_elite, debug):
+def draw_agent(surf, agent: Agent, is_elite: bool, debug: bool):
     col = ELITE_COL if is_elite else NORMAL_COL
     if not agent.alive:
         col = DEAD_COL
-
     ax, ay = int(agent.x), int(agent.y)
 
     # Trail
     if len(agent.trail) > 1:
-        trail_surf = pygame.Surface((SIM_W, SIM_H), pygame.SRCALPHA)
-        n = len(agent.trail)
+        ts = pygame.Surface((SIM_W, SIM_H), pygame.SRCALPHA)
+        n  = len(agent.trail)
+        r, g, b = col
         for i in range(1, n):
-            alpha = int((i / n) * (80 if is_elite else 55))
-            r, g, b = col
-            pygame.draw.line(trail_surf, (r, g, b, alpha),
+            alpha = int((i / n) * (85 if is_elite else 55))
+            pygame.draw.line(ts, (r, g, b, alpha),
                              (int(agent.trail[i-1][0]), int(agent.trail[i-1][1])),
                              (int(agent.trail[i][0]),   int(agent.trail[i][1])), 2)
-        surf.blit(trail_surf, (0, 0))
+        surf.blit(ts, (0, 0))
 
-    # Body circle
-    pygame.draw.circle(surf, col, (ax, ay), 7)
-    pygame.draw.circle(surf, (0, 0, 0), (ax, ay), 7, 1)
+    # Body
+    pygame.draw.circle(surf, col,     (ax, ay), 7)
+    pygame.draw.circle(surf, (0,0,0), (ax, ay), 7, 1)
 
     # Energy arc
-    if agent.alive:
-        arc_rect = pygame.Rect(ax - 10, ay - 10, 20, 20)
-        angle    = agent.energy * 2 * math.pi
-        if angle > 0.05:
-            r, g, b = col
-            arc_surf = pygame.Surface((SIM_W, SIM_H), pygame.SRCALPHA)
-            pygame.draw.arc(arc_surf, (r, g, b, 160),
-                            arc_rect, math.pi / 2 - angle, math.pi / 2, 2)
-            surf.blit(arc_surf, (0, 0))
+    if agent.alive and agent.energy > 0.02:
+        arc_r = pygame.Rect(ax - 10, ay - 10, 20, 20)
+        angle = agent.energy * 2 * math.pi
+        arc_s = pygame.Surface((SIM_W, SIM_H), pygame.SRCALPHA)
+        r, g, b = col
+        pygame.draw.arc(arc_s, (r, g, b, 160),
+                        arc_r, math.pi / 2 - angle, math.pi / 2, 2)
+        surf.blit(arc_s, (0, 0))
 
     # Direction vector
     if agent.alive:
@@ -271,128 +318,147 @@ def draw_agent(surf, agent, is_elite, debug):
         ey  = ay + int((agent.vy / spd) * 14)
         pygame.draw.line(surf, VEC_COL, (ax, ay), (ex, ey), 1)
 
-    # Fitness label (debug)
     if debug and agent.fitness > 0:
-        font_tiny = pygame.font.SysFont("monospace", 10)
-        lbl = font_tiny.render(str(agent.fitness), True, (200, 200, 200))
-        surf.blit(lbl, (ax + 9, ay - 8))
+        ft = pygame.font.SysFont("monospace", 10)
+        surf.blit(ft.render(str(agent.fitness), True, (200, 200, 200)), (ax + 9, ay - 8))
 
 
-def draw_chart(surf, x, y, w, h, best_hist, avg_hist, font_s):
-    pygame.draw.rect(surf, (25, 30, 45), (x, y, w, h), border_radius=4)
-    if len(best_hist) < 2:
+def draw_chart(surf, x, y, w, h, best_h, avg_h, font_s):
+    pygame.draw.rect(surf, (22, 28, 44), (x, y, w, h), border_radius=4)
+    if len(best_h) < 2:
         return
-    mx = max(max(best_hist), 1)
+    mx = max(max(best_h), 1)
 
     def pts(data, col):
-        points = []
-        for i, v in enumerate(data):
-            px = x + int(i / (len(data) - 1) * (w - 8)) + 4
-            py = y + h - 4 - int((v / mx) * (h - 10))
-            points.append((px, py))
+        points = [(x + int(i / (len(data)-1) * (w-8)) + 4,
+                   y + h - 4 - int((v / mx) * (h-10)))
+                  for i, v in enumerate(data)]
         if len(points) > 1:
             pygame.draw.lines(surf, col, False, points, 2)
 
-    pts(best_hist, GREEN_CHART)
-    pts(avg_hist,  BLUE_CHART)
-
-    # Legend
-    pygame.draw.line(surf, GREEN_CHART, (x + 4,  y + h + 6), (x + 16, y + h + 6), 2)
-    surf.blit(font_s.render("best", True, TEXT_LO), (x + 19, y + h + 1))
-    pygame.draw.line(surf, BLUE_CHART,  (x + 50, y + h + 6), (x + 62, y + h + 6), 2)
-    surf.blit(font_s.render("avg",  True, TEXT_LO), (x + 65, y + h + 1))
+    pts(best_h, COL_GREEN)
+    pts(avg_h,  COL_BLUE)
+    pygame.draw.line(surf, COL_GREEN, (x+4,  y+h+6), (x+16, y+h+6), 2)
+    surf.blit(font_s.render("best", True, TEXT_LO), (x+19, y+h+1))
+    pygame.draw.line(surf, COL_BLUE,  (x+52, y+h+6), (x+64, y+h+6), 2)
+    surf.blit(font_s.render("avg",  True, TEXT_LO), (x+67, y+h+1))
 
 
-def draw_panel(surf, state, fonts):
-    fn, fs, ft = fonts  # normal, small, title
+def draw_arch_overlay(surf, net: SnakeNet, font_s, font_n):
+    """Semi-transparent architecture info card."""
+    ow, oh = 310, 170
+    ox, oy = (SIM_W - ow) // 2, (SIM_H - oh) // 2
+    card = pygame.Surface((ow, oh), pygame.SRCALPHA)
+    card.fill((16, 20, 36, 220))
+    pygame.draw.rect(card, (60, 80, 120, 180), (0, 0, ow, oh), 1, border_radius=8)
+
+    lines = [
+        ("PyTorch SnakeNet", TEXT_HI, font_n),
+        ("", TEXT_LO, font_s),
+        (f"  Input   → {INPUT_DIM}  neurons  (sensing)", TEXT_LO, font_s),
+        (f"  Hidden1 → {HIDDEN_DIM}  neurons  (tanh)", COL_GREEN, font_s),
+        (f"  Hidden2 → {HIDDEN_DIM}  neurons  (tanh)", COL_GREEN, font_s),
+        (f"  Output  → {OUTPUT_DIM}   neurons  (tanh, dx/dy)", COL_BLUE, font_s),
+        ("", TEXT_LO, font_s),
+        (f"  Total params : {net.param_count()}", COL_AMBER, font_s),
+        (f"  Evolution     : clone + crossover + mutate", TEXT_LO, font_s),
+        ("  [A] to close", TEXT_LO, font_s),
+    ]
+    ty = 12
+    for text, col, fnt in lines:
+        card.blit(fnt.render(text, True, col), (12, ty))
+        ty += 14
+    surf.blit(card, (ox, oy))
+
+
+def draw_panel(surf, state, fonts, best_h, avg_h):
+    fn, fs, ft = fonts
     px = SIM_W + 12
     pygame.draw.rect(surf, PANEL_BG, (SIM_W, 0, PANEL_W, H))
     pygame.draw.line(surf, PANEL_LINE, (SIM_W, 0), (SIM_W, H), 1)
 
-    y = 18
-    # Title
-    surf.blit(ft.render("EvoSnake", True, TEXT_HI), (px, y)); y += 30
-    pygame.draw.line(surf, PANEL_LINE, (px, y), (px + PANEL_W - 24, y), 1); y += 10
+    y = 16
+    surf.blit(ft.render("EvoSnake", True, TEXT_HI), (px, y)); y += 8
+    surf.blit(fs.render("PyTorch edition", True, COL_AMBER), (px, y + 16)); y += 34
+    pygame.draw.line(surf, PANEL_LINE, (px, y), (px + PANEL_W - 20, y), 1); y += 10
 
-    def row(label, val, highlight=False):
+    def row(label, val, col=TEXT_HI):
         nonlocal y
         surf.blit(fs.render(label, True, TEXT_LO), (px, y))
-        vcol = ELITE_COL if highlight else TEXT_HI
-        surf.blit(fn.render(str(val), True, vcol), (px + 100, y))
+        surf.blit(fn.render(str(val), True, col), (px + 108, y))
         y += 20
 
     row("Generation",  state["gen"])
     row("Step",        f"{state['step']} / {STEPS_PER_GEN}")
-    row("Alive",       f"{state['alive']} / {state['pop_size']}")
-    row("Food",        state["food"])
-    row("Best fit",    state["best"],  highlight=True)
+    row("Alive",       f"{state['alive']} / {state['pop']}")
+    row("Food left",   state["food"])
+    row("Best fit",    state["best"],  col=COL_GREEN)
     row("Avg fit",     f"{state['avg']:.1f}")
+    row("Params/agent", state["params"], col=COL_AMBER)
     y += 4
-    pygame.draw.line(surf, PANEL_LINE, (px, y), (px + PANEL_W - 24, y), 1); y += 10
+    pygame.draw.line(surf, PANEL_LINE, (px, y), (px + PANEL_W - 20, y), 1); y += 10
 
-    # Status tag
-    status     = "⏸ Paused" if state["paused"] else "▶ Running"
-    status_col = (245, 158, 11) if state["paused"] else (74, 222, 128)
+    status     = "⏸  Paused" if state["paused"] else "▶  Running"
+    status_col = COL_AMBER if state["paused"] else COL_GREEN
     surf.blit(fs.render(status, True, status_col), (px, y)); y += 22
 
     row("Speed",    f"{state['speed']} fps")
     row("Mutation", MUT_LABELS[state["mut_idx"]])
-    y += 8
-    pygame.draw.line(surf, PANEL_LINE, (px, y), (px + PANEL_W - 24, y), 1); y += 10
+    y += 6
+    pygame.draw.line(surf, PANEL_LINE, (px, y), (px + PANEL_W - 20, y), 1); y += 10
 
-    # Fitness chart
     surf.blit(fs.render("Fitness history", True, TEXT_LO), (px, y)); y += 16
     chart_h = 80
-    draw_chart(surf, px, y, PANEL_W - 24, chart_h,
-               state["best_hist"], state["avg_hist"], fs)
+    draw_chart(surf, px, y, PANEL_W - 20, chart_h, best_h, avg_h, fs)
     y += chart_h + 26
+    pygame.draw.line(surf, PANEL_LINE, (px, y), (px + PANEL_W - 20, y), 1); y += 10
 
-    pygame.draw.line(surf, PANEL_LINE, (px, y), (px + PANEL_W - 24, y), 1); y += 10
-
-    # Controls help
     for line in ["SPACE  Pause/Resume",
                  "R      Reset",
                  "N      Next gen",
                  "↑↓     Speed",
                  "M      Mutation",
-                 "D      Debug",
+                 "A      Architecture",
+                 "D      Debug labels",
                  "ESC/Q  Quit"]:
         surf.blit(fs.render(line, True, TEXT_LO), (px, y)); y += 16
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 def main():
     pygame.init()
     screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("EvoSnake — Neuroevolution Simulation")
+    pygame.display.set_caption("EvoSnake — PyTorch Neuroevolution")
     clock = pygame.time.Clock()
 
-    font_n = pygame.font.SysFont("segoeui",    14)
-    font_s = pygame.font.SysFont("segoeui",    12)
-    font_t = pygame.font.SysFont("segoeui",    20, bold=True)
+    font_n = pygame.font.SysFont("segoeui", 14)
+    font_s = pygame.font.SysFont("segoeui", 12)
+    font_t = pygame.font.SysFont("segoeui", 20, bold=True)
     fonts  = (font_n, font_s, font_t)
 
-    # Simulation state
-    agents     = [Agent() for _ in range(POP_SIZE)]
-    foods      = spawn_food(FOOD_COUNT)
-    gen        = 1
-    step       = 0
-    paused     = False
-    debug      = False
-    speed      = 30
-    mut_idx    = 1
-    best_hist  = []
-    avg_hist   = []
+    # ── Initial population ──────────────────────────────
+    agents    = [Agent() for _ in range(POP_SIZE)]
+    foods     = spawn_food(FOOD_COUNT)
+    gen       = 1
+    step      = 0
+    paused    = False
+    debug     = False
+    show_arch = False
+    speed     = 30
+    mut_idx   = 1
+    best_hist: list[float] = []
+    avg_hist:  list[float] = []
 
     sim_surf = pygame.Surface((SIM_W, SIM_H))
+    ref_net  = agents[0].net   # for param count display
 
     running = True
     while running:
         clock.tick(FPS_CAP)
 
-        # ── Events ──────────────────────────────
+        # ── Events ────────────────────────────────────
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
@@ -405,95 +471,92 @@ def main():
                 elif k == pygame.K_r:
                     agents    = [Agent() for _ in range(POP_SIZE)]
                     foods     = spawn_food(FOOD_COUNT)
-                    gen       = 1
-                    step      = 0
-                    best_hist = []
-                    avg_hist  = []
+                    ref_net   = agents[0].net
+                    gen, step = 1, 0
+                    best_hist.clear(); avg_hist.clear()
                 elif k == pygame.K_n:
-                    # Force next generation
-                    fits      = [a.fitness for a in agents]
+                    fits = [a.fitness for a in agents]
                     best_hist.append(max(fits, default=0))
                     avg_hist.append(sum(fits) / max(len(fits), 1))
                     if len(best_hist) > 50: best_hist.pop(0); avg_hist.pop(0)
-                    agents = evolve(agents, MUT_PRESETS[mut_idx], POP_SIZE)
+                    agents = evolve(agents, MUT_RATES[mut_idx], POP_SIZE)
                     foods  = spawn_food(FOOD_COUNT)
-                    gen   += 1
-                    step   = 0
+                    gen += 1; step = 0
                 elif k == pygame.K_UP:
                     speed = min(120, speed + 5)
                 elif k == pygame.K_DOWN:
                     speed = max(5, speed - 5)
                 elif k == pygame.K_m:
-                    mut_idx = (mut_idx + 1) % len(MUT_PRESETS)
+                    mut_idx = (mut_idx + 1) % len(MUT_RATES)
                 elif k == pygame.K_d:
                     debug = not debug
+                elif k == pygame.K_a:
+                    show_arch = not show_arch
 
-        # ── Simulation steps ────────────────────
+        # ── Simulation ticks ──────────────────────────
         if not paused:
-            steps_this_frame = max(1, speed // 30)
-            for _ in range(steps_this_frame):
+            ticks = max(1, speed // 30)
+            for _ in range(ticks):
                 if step >= STEPS_PER_GEN:
-                    fits      = [a.fitness for a in agents]
+                    fits = [a.fitness for a in agents]
                     best_hist.append(max(fits, default=0))
                     avg_hist.append(sum(fits) / max(len(fits), 1))
                     if len(best_hist) > 50: best_hist.pop(0); avg_hist.pop(0)
-                    agents = evolve(agents, MUT_PRESETS[mut_idx], POP_SIZE)
+                    agents = evolve(agents, MUT_RATES[mut_idx], POP_SIZE)
                     foods  = spawn_food(FOOD_COUNT)
-                    gen   += 1
-                    step   = 0
+                    gen += 1; step = 0
 
-                eaten_foods = set()
+                to_replace = []
                 for a in agents:
-                    f = a.step(foods)
-                    if f is not None:
-                        idx = foods.index(f)
-                        eaten_foods.add(idx)
+                    eaten = a.step(foods)
+                    if eaten is not None:
+                        to_replace.append(eaten)
 
-                for idx in sorted(eaten_foods, reverse=True):
-                    foods.pop(idx)
-                    foods.append([
-                        random.uniform(15, SIM_W - 15),
-                        random.uniform(15, SIM_H - 15)
-                    ])
+                for f in to_replace:
+                    if f in foods:
+                        foods.remove(f)
+                    foods.append([random.uniform(15, SIM_W-15),
+                                  random.uniform(15, SIM_H-15)])
 
                 if len(foods) < FOOD_COUNT:
                     foods += spawn_food(FOOD_COUNT - len(foods))
 
                 step += 1
 
-        # ── Rendering ───────────────────────────
+        # ── Render simulation canvas ──────────────────
         sim_surf.fill(BG)
         draw_grid(sim_surf)
         draw_food(sim_surf, foods)
 
-        # Determine elite set
         ranked  = sorted(agents, key=lambda a: a.fitness, reverse=True)
         n_elite = max(1, int(len(ranked) * ELITE_FRAC))
-        elite_s = set(id(a) for a in ranked[:n_elite])
+        elite_s = {id(a) for a in ranked[:n_elite]}
 
         for a in agents:
             draw_agent(sim_surf, a, id(a) in elite_s, debug)
 
+        if show_arch:
+            draw_arch_overlay(sim_surf, ref_net, font_s, font_n)
+
+        # ── Compose final frame ───────────────────────
         screen.fill(BG)
         screen.blit(sim_surf, (0, 0))
 
-        fits = [a.fitness for a in agents]
+        fits  = [a.fitness for a in agents]
         state = {
-            "gen":       gen,
-            "step":      step,
-            "alive":     sum(1 for a in agents if a.alive),
-            "pop_size":  POP_SIZE,
-            "food":      len(foods),
-            "best":      max(fits, default=0),
-            "avg":       sum(fits) / max(len(fits), 1),
-            "paused":    paused,
-            "speed":     speed,
-            "mut_idx":   mut_idx,
-            "best_hist": best_hist,
-            "avg_hist":  avg_hist,
+            "gen":    gen,
+            "step":   step,
+            "alive":  sum(1 for a in agents if a.alive),
+            "pop":    POP_SIZE,
+            "food":   len(foods),
+            "best":   max(fits, default=0),
+            "avg":    sum(fits) / max(len(fits), 1),
+            "paused": paused,
+            "speed":  speed,
+            "mut_idx": mut_idx,
+            "params": ref_net.param_count(),
         }
-        draw_panel(screen, state, fonts)
-
+        draw_panel(screen, state, fonts, best_hist, avg_hist)
         pygame.display.flip()
 
     pygame.quit()
@@ -501,4 +564,6 @@ def main():
 
 
 if __name__ == "__main__":
+    print(f"PyTorch {torch.__version__} | Device: {DEVICE}")
+    print(f"SnakeNet params per agent: {SnakeNet().param_count()}")
     main()
