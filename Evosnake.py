@@ -51,7 +51,7 @@ OUTPUT_DIM  = 2
 MUT_RATES  = [0.02, 0.07, 0.18]
 MUT_LABELS = ["Low  0.02", "Med  0.07", "High 0.18"]
 
-DEVICE = torch.device("cpu")   # CPU is plenty fast for small nets
+DEVICE = torch.device("cpu")   
 
 # ──────────────────────────────────────────────────────────
 # COLOURS
